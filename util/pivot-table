@@ -1,0 +1,208 @@
+#!/bin/bash
+################################################################################
+#-
+#- NAME
+#-	pivot-table
+#-
+#- SYNOPSIS
+#-	pivot-table [OPTION] filename
+#+	pivot-table [-c columns] [-f {sum|avg|min|max|cnt}] [-h] [-i input_delimiter] [-o output_delimiter] [-r rows] [-s {KB|MB|GB|TB}] [-v values] filename
+#-
+#- DESCRIPTION
+#-
+#- OPTIONS
+#-	-c	Column name for the columns data. Default is column 2.
+#-	-f	Aggregate function to apply to the data. Valid values are sum, avg, min, max, and cnt. Default is sum.
+#-	-h	Show help
+#-	-i	Input delimiter. Default is whitespace.
+#-	-o	Ouput delimiter. Default is whitespace.
+#-	-r	Column name of the rows data. Default is column 1.
+#-	-s	Output scale of values. Valid values are KB, MB, GB, and TB. Assumes input values have a scale of bytes.
+#-	-v	Column name of the values data. Default is column 3.
+#-
+################################################################################
+
+export PATH=/bin:/usr/bin:/usr/local/bin:.
+NAME="${0##*/}"
+BASE=$(cd "${0%/*}"; pwd)
+
+showusage () {
+        echo "usage:" >&2
+        awk '/^\#\+/ {print $0}' ${BASE}/${NAME} | sed 's/^#+/ /' >&2
+}
+
+showhelp () {
+        awk '/^\#-/ {print $0}' ${BASE}/${NAME} | sed 's/^#-/ /'
+}
+
+
+while getopts ":c:f:hi:o:r:s:v:" opt; do
+	case "${opt}" in
+		c)	colscolname=${OPTARG};;
+		f)	case "${OPTARG}" in 
+				sum)	operation=sum;;
+				avg)	operation=avg;;
+				min)	operation=min;;
+				max)	operation=max;;
+				cnt)	operation=cnt;;
+				*)	echo "${NAME}: invalid value for -f option, use -h for help." 1>&2; exit 1;;
+			esac;;
+		h)	showhelp
+			exit 0;;
+		i)	idelim="-F${OPTARG}";;
+		o)	odelim="${OPTARG}";;
+		r)	rowscolname=${OPTARG};;
+		s)	case "${OPTARG}" in
+				KB)	scale=KB;;
+				MB)	scale=MB;;
+				GB)	scale=GB;;
+				TB)	scale=TB;;
+				*)	echo "${NAME}: invalid value for -s option, use -h for help." 1>&2; exit 1;;
+			esac;;
+		v)	valscolname=${OPTARG};;
+		\?)	showusage; exit;;
+	esac
+done
+shift $((${OPTIND} - 1))
+
+awk ${idelim} -v colscolname=${colscolname} -v delimiter=${odelim} -v operation=${operation} -v rowscolname=${rowscolname} -v scale=${scale} -v valscolname=${valscolname} '
+	BEGIN {
+		if (!operation) {
+			operation="sum";
+		}
+	}
+
+	FNR==1 {
+		label_count = split($0,labels);
+	
+		for (i=1;i<=label_count;i++) {
+			gsub(/^[ \t]+|[ \t]+$/,"",labels[i]);
+
+			if (labels[i] == rowscolname) {
+				rowscolnum = i;
+			}
+
+			if (labels[i] == colscolname) {
+				colscolnum = i;
+			}
+
+			if (labels[i] == valscolname) {
+				valscolnum = i;
+			}	
+		}
+	
+		if (rowscolname == "") {
+			rowscolname = $(1);
+			rowscolnum  = 1;
+		}
+
+		if (colscolname == "") {
+			colscolname = $(2);
+			colscolnum  = 2;
+		}
+
+		if (valscolname == "") {
+			valscolname = $(3);
+			valscolnum = 3;
+		}
+
+			
+		if (delimiter) {
+			row_format = "%s";
+			col_format = "%s";
+			val_format = "%.2f";
+		} else {
+			row_format = "%-35s";
+			col_format = "%18s";
+			val_format = "%18.2f";
+		}	
+	}
+
+	FNR != 1 {
+		row = $(rowscolnum);
+		col = $(colscolnum);
+                val = $(valscolnum);
+
+		rows[row];
+		cols[col];
+
+		if (scale) {
+			split("B,KB,MB,GB,BG",scales,",");
+			for (i=1;scales[i]!=scale;i++) {
+				val /= 1024;
+			}
+		}
+
+		row_counts[row]		++;
+		col_counts[col]		++;
+		val_counts[row,col]	++;
+		tot_count		++;
+
+		row_sums[row]		+= val;
+		col_sums[col]		+= val;
+		val_sums[row,col]	+= val;
+		tot_sum			+= val;
+
+		if (operation == "cnt") {
+			row_totals[row]	= row_counts[row];
+			col_totals[col] = col_counts[col];
+			vals[row,col] 	= val_counts[row,col];
+			total		= tot_count;
+		}
+
+		if (operation == "sum") {
+			row_totals[row]	= row_sums[row];
+			col_totals[col] = col_sums[col];
+			vals[row,col] 	= val_sums[row,col];
+			total		= tot_sum;
+		}
+
+		if (operation == "avg") {
+			row_totals[row]	= row_sums[row] / row_counts[row];
+			col_totals[col]	= col_sums[col] / col_counts[col];
+			vals[row,col]	= val_sums[row,col] / val_counts[row,col];
+			total		= tot_sum / tot_count;
+		}
+
+		if (operation == "min") {
+			if (row_totals[row] == "" || row_totals[row] > val) row_totals[row] = val;
+			if (col_totals[col] == "" || col_totals[col] > val) col_totals[col] = val;
+			if (vals[row,col] == "" || vals[row,col] > val) vals[row,col] = val;
+			if (total == "" || total > val) total = val;
+		}
+
+		if (operation == "max") {
+			if (row_totals[row] == "" || row_totals[row] < val) row_totals[row] = val;
+			if (col_totals[col] == "" || col_totals[col] < val) col_totals[col] = val;
+			if (vals[row,col] == "" || vals[row,col] < val) vals[row,col] = val;
+			if (total == "" || total < val) total = val;
+		}
+	}
+
+	END {
+		if (scale) {
+			scale = " in " scale;
+		}
+
+		printf row_format delimiter,rowscolname " (" operation " of " valscolname scale ")";
+		for (col in cols) {
+			printf col_format delimiter,col;
+                }
+                printf col_format "\n","Total";
+
+		n = asorti(rows, rowsorted)
+		for (i = 1; i <= n; i++) {
+			printf row_format delimiter,rowsorted[i]
+			for (col in cols) {
+				printf val_format delimiter,vals[rowsorted[i],col];
+			}
+			printf val_format "\n",row_totals[rowsorted[i]];
+		}
+
+                printf row_format delimiter,"Total"
+                for (col in cols) {
+			printf val_format delimiter,col_totals[col];
+		}
+                printf val_format "\n",total;
+	}
+' $@

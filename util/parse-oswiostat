@@ -1,0 +1,133 @@
+#!/bin/bash
+################################################################################
+#-
+#- NAME
+#-      parse-oswiostat
+#-
+#- SYNOPSIS
+#-      parse-oswiostat [OPTION] filename
+#+      parse-oswiostat [-d device[:group]] [-hm]] [-o delimiter] filename
+#-
+#- DESCRIPTION
+#-
+#- OPTIONS
+#-      -h      Show help
+#-      -d      Device filer. Comma separated values. Group mapping is colon separated. Format: "dev1:group1,dev2:group1,dev3:group2"
+#-      -m      Show main device only, ie, ignore partitions
+#-      -o      Output delimiter
+#-
+################################################################################
+
+export PATH=/bin:/usr/bin:/usr/local/bin:.
+NAME="${0##*/}"
+BASE=$(cd "${0%/*}"; pwd)
+
+showusage () {
+        echo "usage:" >&2
+        awk '/^\#\+/ {print $0}' ${BASE}/${NAME} | sed 's/^#+/ /' >&2
+}
+
+showhelp () {
+        awk '/^\#-/ {print $0}' ${BASE}/${NAME} | sed 's/^#-/ /'
+}
+
+
+while getopts ":d:hmo:" opt; do
+	case "${opt}" in
+		d)  devlist=${OPTARG};;
+		h)  showhelp; exit;;
+		m)  maindevice=true;;
+		o)  odelim=${OPTARG};;
+		\?) showusage; exit;;
+	esac
+done
+shift $((${OPTIND} - 1))
+
+awk -v devlist="${devlist}" -v maindevice="${maindevice}" -v odelim=${odelim} '
+	BEGIN {
+		monthArr["Jan"] = "01";
+		monthArr["Feb"] = "02";
+		monthArr["Mar"] = "03";
+		monthArr["Apr"] = "04";
+		monthArr["May"] = "05";
+		monthArr["Jun"] = "06";
+		monthArr["Jul"] = "07";
+		monthArr["Aug"] = "08";	
+		monthArr["Sep"] = "09";
+		monthArr["Oct"] = "10";
+		monthArr["Nov"] = "11";
+		monthArr["Dec"] = "12";
+
+		split(devlist, devlistArr, ",")
+		for (i in devlistArr) {
+			split(devlistArr[i], tmpArr, ":")
+			if (maindevice) {
+				gsub(/[0-9]/,"",tmpArr[1]);
+			}
+			if (!tmpArr[2]) tmpArr[2]="-";
+			deviceArr[tmpArr[1]] = tmpArr[2];
+		}
+
+		if (odelim) {
+			norm_format = "%s";
+			wide_format = "%s";
+		} else {
+			norm_format = "%10s";
+			wide_format = "%20s";
+		}
+	}
+
+	/^zzz/ {
+		snap++;
+		split($0, dateArr, " ");
+		timestamp = dateArr[7]"-"monthArr[dateArr[3]]"-"dateArr[4]":"dateArr[5];
+		next;
+	}
+
+	/^avg-cpu/ {
+		split($0,cpuheaders);
+		getline;
+		split($0,cpustats);
+	}
+
+	/^Device/ && (header != 1) {
+		printf norm_format odelim,"snap";
+		printf wide_format odelim,"timestamp";
+		printf wide_format odelim,"host";
+
+		for (i = 2; i <= 7; i++) {
+			printf norm_format odelim,cpuheaders[i];
+		}
+
+		printf norm_format odelim,"group";
+		printf norm_format odelim,"device";
+
+		for (i = 2; i <= NF; i++) {
+			printf norm_format odelim,$(i);
+		}	
+		printf "\n";
+
+		header=1;
+		next;
+	}
+
+	/^[sd][dm]/ && ((deviceArr[$1]) || (!devlist)) {
+		n = split(FILENAME,filenameArr,"/")
+		n = split(filenameArr[n],filenameArr,"_")
+
+		printf norm_format odelim,snap;
+		printf wide_format odelim,timestamp;
+		printf wide_format odelim,filenameArr[1];
+
+		for (i = 1; i <= 6; i++) {
+			printf norm_format odelim,cpustats[i];
+		}
+
+		printf norm_format odelim,deviceArr[$1];
+
+		for (i = 1; i <= NF; i++) {
+			printf norm_format odelim,$(i);
+		}
+		printf "\n";
+  	}
+' $@

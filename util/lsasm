@@ -1,0 +1,23 @@
+#!/bin/bash
+DEV=$(ls -l /dev/)
+MAP=$(ls -l /dev/mapper/)
+
+kfed="$(awk -F: '/^+ASM/ {print $2}' /etc/oratab)/bin/kfed"
+
+printf '%-15s %-10s %-25s %-15s %-20s %-15s\n' major,minor size_gb /dev/oracleasm/disks /dev /dev/mapper diskgroup $(
+        ls -l /dev/oracleasm/disks/* | awk '{print $5,$6,$(NF)}' | while read major minor path; do
+                dev=$(echo "${DEV}" | grep -w "${major} *${minor}"); dev=${dev##* }
+                map=$(echo "${MAP}" | grep -w "${major} *${minor}"); map=${map##* }
+		grp=$(${kfed} read ${path} 2>/dev/null | awk '
+				/^kfdhdb.grpname:/	{grpname=$2}
+				/^kfdhdb.hdrsts:/	{hdrsts=$2}
+				END 			{ if (hdrsts == "3") print grpname };
+			'
+		)
+		# siz=$(lsblk -lno SIZE ${path} 2>/dev/null)
+		# siz=$(${kfed} read ${path} 2>/dev/null | awk '/^kfdhdb.dsksize:/ { printf "%.0f\n", $2/1024}')
+		siz=$(fdisk -l ${path} 2>/dev/null | awk '/^Disk.*bytes$/ {printf "%.0f\n", $5/1024/1024/1024}')
+                echo "${major}${minor} ${siz:-"n/a"} ${path##*/} ${dev:-"n/a"} ${map:-"n/a"} ${grp:-"n/a"}"
+        done
+)
+
