@@ -1,0 +1,656 @@
+#!/bin/bash
+# chkconfig: 2345 99 10
+# description: Oracle auto start-stop script.
+#
+# Init file for Oracle databases
+#
+
+# todo:
+# * add start/stop functions for dbconsole ($OH/hostname_sid)
+# * add config file for listeners not picked up by oratab
+# * add config file for instance start options
+# * revisit asm portion of start function
+# * create stoplistener function
+# * add stopping of listeners to stop function
+
+# source function library
+. /etc/rc.d/init.d/functions
+
+getcanonicalpath () {
+        local name=${1##*/}
+        local base=$(cd -P "${1%/*}"; pwd)
+
+        if [[ -h "${base}/${name}" ]]; then
+                cd "${base}"
+                getcanonicalpath "$(ls -l ${name} | awk '{print $(NF)}')"
+        else
+                echo "${base}/${name}"
+        fi
+}
+
+canonical=$(getcanonicalpath "${0}")
+NAME=${canonical##*/}
+BASE=${canonical%/*}
+HOST=$(hostname)
+
+SUBSYS=/var/lock/subsys/${NAME}
+ORATAB_FILE=/etc/oratab
+ORATAB=$(awk -F\# '{print $1}' ${ORATAB_FILE} | awk '!/^[ \t]*$/ {print $0}')
+
+DEFAULT_TIMEOUT=300
+DEFAULT_INTERVAL=10
+
+DB_STARTUP_TIMEOUT=${DEFAULT_TIMEOUT}
+DB_SHUTDOWN_TIMEOUT=${DEFAULT_TIMEOUT}
+CSS_START_TIMEOUT=${DEFAULT_TIMEOUT}
+ASM_START_TIMEOUT=${DEFAULT_TIMEOUT}
+
+unset canonical
+
+action () {
+	local string=${1}
+	local output
+
+	echo -n "${string}: "
+	echo "${string}" | logger -t ${NAME}
+	shift 
+
+	
+	output=$(eval $* 2>&1) 
+	if [[ $? -eq 0 ]]; then
+		echo_success
+		echo
+		echo "${output}" | logger -t ${NAME}
+		echo "${string} succeeded" | logger -t ${NAME}
+		return 0
+	else
+		echo_failure
+		echo
+		echo "${output}" | logger -s -t ${NAME};
+		echo "${string} failed" | logger -s -t ${NAME};
+		return 1
+	fi
+}
+
+getoraclehome () {
+	if [[ -z "${1}" ]]; then 
+		echo "usage: ${FUNCNAME} ORACLE_SID" 1>&2; return 1
+	fi
+
+	local oracle_sid=$1
+	local oracle_home
+
+	oracle_home=$(awk -F: '{if ($1 == "'${oracle_sid}'") {print $2; exit}}' ${ORATAB_FILE} 2>/dev/null)
+
+	if [[ -z "${oracle_home}" ]]; then
+		echo "${FUNCNAME}(${oracle_sid}): unable to get ORACLE_HOME. Check ${ORATAB_FILE}." 1>&2
+		return 1
+	fi
+
+	echo "${oracle_home}"
+	return 0
+}
+
+statusinstance () {
+	if [[ -z "${1}" ]]; then
+		echo "usage: ${NAME} ${FUNCNAME} ORACLE_SID" 1>&2; return 1
+	fi
+
+	local type
+	local output
+	local orauser
+	local curuser
+
+	export ORACLE_SID=${1}
+	ORACLE_HOME=$(getoraclehome "${ORACLE_SID}") || return 1
+	export ORACLE_HOME
+
+	case $(echo "${ORACLE_SID}" | cut -b 1) in
+		+)      type="asm";;
+		*)      type="ora";;
+	esac
+
+	if [[ -z "$(ps -ef | grep -w "${type}_pmon_${ORACLE_SID}" | grep -v grep)" ]]; then
+		echo "STOPPED"
+	else
+		orauser=$(ls -l ${ORACLE_HOME}/bin/oracle | awk '{print $3}') || return 1
+		curuser=$(id -un) || return 1
+		
+		if [[ ${orauser} != ${curuser} ]]; then
+			if [[ ${curuser} = "root" ]]; then
+				su ${orauser} -c "${BASE}/${NAME} statusinstance ${ORACLE_SID}" || return 1
+			else
+				echo "${FUNCNAME}(${ORACLE_SID}): you must be ${orauser} or root to execute this command." 1>&2
+				return 1
+			fi
+		else
+			output=$(
+				echo "	set lin 200 pages 0 feed off head off
+					whenever sqlerror exit 1
+					whenever oserror exit 1
+					select status from v\$instance;
+				" | ${ORACLE_HOME}/bin/sqlplus -s '/ as sysdba'
+			) || { echo "${output}"; return 1; }
+			echo "${output}"
+		fi
+	fi
+	return 0
+}
+
+
+getcrshome () {
+	local crs_init_script
+	local ora_crs_home
+
+	for crs_init_script in $(awk -F: '!/^#/ {if ($4 ~ /ohasd/ || $4 ~ /crsd/) {split($4,cmd," "); print cmd[1]}}' /etc/inittab); do
+		ora_crs_home=$(awk -F= '/ORA_CRS_HOME=/ {print $2}' ${crs_init_script}) || return 1
+	done
+
+	if [[ -z ${ora_crs_home} ]]; then
+		echo "${FUNCNAME}(): unable to get ORA_CRS_HOME" 1>&2
+		return 1
+	fi
+	
+	echo "${ora_crs_home}"
+	return 0
+}
+
+getfileowner () {
+	if [[ -z "${1}" ]]; then
+		echo "usage: ${FUNCNAME} filename" 1>&2
+		return 1
+	fi
+
+	local file=${1}
+	local owner
+
+	if [[ ! -f "${file}" ]]; then
+		echo "${FUNCNAME}(${file}): file does not exist or is not accessible by $(id -un)" 1>&2
+		return 1
+	fi
+
+	ls -l "${file}" | awk '{print $3}' || return 1
+	return 0
+}
+
+listlisteners () {
+	local oracle_sid
+	local oracle_home
+	local orauser
+	local listener
+	local start_opt
+
+	echo "${ORATAB}" | awk -F: '{print $1,$3}' | while read oracle_sid start_opt; do
+		local tns_admin=""
+		local listeners=""
+
+		oracle_home=$(getoraclehome ${oracle_sid}) || continue
+
+		# for ebiz environments
+        	if [[ -f ${oracle_home}/${oracle_sid}_${HOST%%.*}.env ]]; then
+			eval $(grep TNS_ADMIN= ${oracle_home}/${oracle_sid}_${HOST%%.*}.env)
+			tns_admin=${TNS_ADMIN}
+			unset TNS_ADMIN
+		fi
+
+		tns_admin=${tns_admin:-"${oracle_home}/network/admin"}
+
+		orauser=$(getfileowner "${oracle_home}/bin/lsnrctl") || continue
+
+		if [[ -f "${tns_admin}/listener.ora" ]]; then
+			listeners=$(cat "${tns_admin}/listener.ora" | parsesqlnet | grep -i "address[ ]*=" | awk -F: '{print $1}')
+		fi
+	
+		for listener in ${listeners:-""}; do
+			echo "${listener}:${orauser}:${oracle_home}:${tns_admin}:${start_opt}"
+		done
+	done | sort -u
+}
+
+startlistener () {
+	if [[ $# -ne 1 ]]; then
+                echo "usage: ${NAME} ${FUNCNAME} LISTENER_NAME" 1>&2; return 1
+        fi
+
+	local listener_name=${1}
+	local listener_conf
+	local orauser
+	local oracle_home
+	local tns_admin
+	local start
+	local curuser
+	local output
+	local i
+
+	curuser=$(id -un) || return 1
+
+	listener_conf=($(listlisteners | awk -F: '{if (toupper($1) == "'$(echo "${listener_name}" | tr [a-z] [A-Z])'") {print $0}}'))
+
+	if [[ ${#listener_conf[*]} -eq 0 ]]; then
+		echo "${FUNCNAME}('${listener_name}'): unable to find listener" 1>&2
+		return 1
+	fi
+
+	if [[ ${#listener_conf[*]} -gt 1 ]]; then 
+		listener_conf=($(for i in ${!listener_conf[*]}; do echo ${listener_conf[$i]}; done | awk -F: '{if ($5 ~ /^Y/) {print $0}}'))
+
+		if [[ ${#listener_conf[*]} -gt 1 ]]; then
+			echo "${FUNCNAME}('${listener_name}'): found multiple listeners with the same name and start option of Y" 1>&2
+			return 1
+		fi
+
+		if [[ ${#listener_conf[*]} -eq 0 ]]; then
+			echo "${FUNCNAME}('${listener_name}'): found multiple listeners with the same name and none with a start option of Y" 1>&2
+			return 1
+		fi
+	fi
+
+	for var in listener_name orauser oracle_home tns_admin start; do
+		eval ${var}=${listener_conf%%:*}
+		listener_conf=${listener_conf#*:}
+	done
+
+
+	if [[ "${orauser}" != "${curuser}" ]]; then 
+		if [[ "${curuser}" = "root" ]]; then
+			su ${orauser} -c "${BASE}/${NAME} ${FUNCNAME} ${listener_name}" || return 1
+		else
+			echo "${FUNCNAME}('${listener_name}'): you must be ${orauser} or root to execute this command." 1>&2
+		fi
+	else
+		export ORACLE_HOME=${oracle_home}
+		export TNS_ADMIN=${tns_admin}
+		${ORACLE_HOME}/bin/lsnrctl status ${listener_name} > /dev/null 2>&1 && { echo "Listener \"${listener_name}\" is aready running"; return 0; }
+		${ORACLE_HOME}/bin/lsnrctl start  ${listener_name} || return 1
+	fi
+}
+
+statuscrsasm () {
+	local ora_crs_home
+	local orauser
+	local curuser
+	local node
+	local output
+
+	ora_crs_home=$(getcrshome) || return 1
+        orauser=$(getfileowner ${ora_crs_home}/bin/srvctl) || return 1
+        curuser=$(id -un) || return 1
+
+        if [[ ${orauser} != ${curuser} ]]; then
+                if [[ ${curuser} = "root" ]]; then
+                        su ${orauser} -c "${BASE}/${NAME} statuscrsasm" || return 1
+                else
+                        echo "${FUNCNAME}(): you must be ${orauser} or root to execute this command." 1>&2
+                        return 1
+                fi
+        else
+		node=$(${ora_crs_home}/bin/olsnodes -l) || { echo "${node}"; return 0; } 
+		monitorprocess "${ora_crs_home}/bin/srvctl status asm -n ${node}" 10 1
+		return 0
+	fi
+}
+
+waitforcrsasm () {
+	local i=0
+	local output
+
+	output=$(statuscrsasm) || return 1
+
+	while [[ -z "$(echo "${output}" | grep "^ASM.*is running")" ]] && [[ ${i} -lt $(( ${ASM_START_TIMEOUT} )) ]]; do
+		sleep ${DEFAULT_INTERVAL}
+		i=$(( ${i} + ${DEFAULT_INTERVAL} ))
+		output=$(statuscrsasm) || return 1
+	done
+
+	if [[ -n "$(echo "${output}" | grep "^ASM.*is running")" ]]; then
+		echo "${output}"
+		return 0
+	else
+		echo "${FUNCNAME}(): timeout" 1>&2
+		return 1
+	fi
+}
+
+killprocess () {
+	# recursively kills child processes then parents
+
+	local pid=${1}
+	local proc
+
+	for proc in $(ps -ef| awk '{if ($3 == "'${pid}'") {print $2}}'); do
+		killprocess ${proc}
+	done
+		
+	kill -9 ${pid} > /dev/null 2>&1
+}
+
+monitorprocess () {
+	local command=${1}
+	local timeout=${2:-"${DEFAULT_TIMEOUT}"}
+	local interval=${3:-"${DEFAULT_INTERVAL}"}
+	local output
+	
+	output=$(
+		eval "${command} 2>&1 &"
+		local pid=$!
+		local i=0
+		while [[ -n "$(jobs -r)" ]] && [[ $(( ${timeout} / ${interval} )) -gt ${i} ]]; do
+			sleep ${interval}
+			i=$(( ${i} + 1 ))
+		done
+
+		if [[ -n "$(jobs -r)" ]]; then
+			echo "${FUNCNAME}:timeout"
+			killprocess ${pid}
+			sleep 1
+		fi
+	)
+
+	if [[ $(echo "${output}" | grep "${FUNCNAME}:timeout" | wc -l) -gt 0 ]]; then
+		echo "${FUNCNAME}(${command}): timeout(${timeout}) during execution" 1>&2
+		return 1
+	fi
+
+	echo "${output}"
+	return 0
+}
+
+parsesqlnet () {
+        awk '
+                BEGIN {
+                        depth = 0;
+                        indx = 0;
+                }
+
+                {
+                        chars=split($0,array_chars,"");
+
+                        for (i=1;i<=chars;i++) {
+                                if (array_chars[i] == "#") {
+                                        break;
+                                }
+
+                                if (array_chars[i] == "(") {
+                                        depth++;
+                                        if (indx == 0) {
+                                                depth--;
+                                        }
+                                        if (depth == 0) {
+                                                array_chars[i] = " ";
+                                        }
+                                }
+
+                                if (array_chars[i] == ")") {
+                                        depth--;
+                                        if (depth < 0) {
+                                                array_chars[i] = " ";
+                                        }
+                                }
+
+                                if (array_chars[i] == "=" && depth <= 0) {
+                                        words=split(tmp,array_words," ");
+                                        name[indx+1] = array_words[words];
+                                        pos=index(tmp,array_words[words])
+                                        value[indx] = substr(tmp,1,pos-1)
+                                        tmp = "";
+                                        indx++;
+                                        continue;
+                                }
+
+                                tmp = tmp array_chars[i];
+                        }
+                        tmp = tmp " ";
+                }
+
+                END {
+                        value[indx] = tmp;
+                        for (j=1;j<=indx;j++) {
+                                print name[j]":"value[j];
+                        }
+                }
+        '
+}
+
+
+start () {
+	local oracle_sid
+	local oracle_sid_list
+	local listener_name
+	local listener_name_list
+	local crs_asm_status=1
+
+	echo "Starting Oracle:"
+
+	# get a list of unique listeners only for databases with a Y 
+	listener_name_list=$(listlisteners | awk -F: '{if ($5  ~ /^Y/) {print "\""$1"\""}}' | sort -u)
+
+	# start all listeners that have been defined manually defined
+	for listener_name in $(echo "${listener_name_list}" | grep -v '""'); do
+		( action $"Starting listener ${listener_name}" ${BASE}/${NAME} startlistener ${listener_name} ) 
+	done
+
+	# if there are no manually defined listeners, try to start listeners that have no listener.ora
+	if [[ $(echo "${listener_name_list}" | grep -v '""' | wc -l) -eq 0 ]]; then
+		for listener_name in $(echo "${listener_name_list}" | grep '""'); do
+			( action $"Starting listener ${listener_name}" ${BASE}/${NAME} startlistener ${listener_name} )
+		done
+	fi
+
+	# startup ASM instances with a Y
+	for oracle_sid in $(echo "${ORATAB}" | awk -F: '{if ($1 ~ /^+/ && $3 ~ /^Y/) {print $1}}'); do
+		( action $"Starting instance ${oracle_sid}" ${BASE}/${NAME} startinstance ${oracle_sid} )
+	done
+
+	# start non ASM instances with a Y
+	for oracle_sid in $(echo "${ORATAB}" | awk -F: '{if ($1 !~ /^+/ && $3 ~ /^Y/) {print $1}}'); do
+		( action $"Starting instance ${oracle_sid}" ${BASE}/${NAME} startinstance ${oracle_sid} )
+	done	
+
+	# start non ASM instances with a W after CRS brings ASM is up.
+	oracle_sid_list=$(echo "${ORATAB}" | awk -F: '{if ($1 !~ /^+/ && $3 ~ /^W/) {print $1}}')
+	if [[ -n $(echo "${oracle_sid_list}") ]]; then
+		action $"Waiting for CRS to start ASM" ${BASE}/${NAME} waitforcrsasm && crs_asm_status=0
+		for oracle_sid in ${oracle_sid_list}; do
+			if [[ ${crs_asm_status} -eq 0 ]]; then
+				( action $"Starting instance ${oracle_sid}" ${BASE}/${NAME} startinstance ${oracle_sid} )
+			else
+				 action $"Starting instace ${oracle_sid}" "{ echo \"Instance ${oracle_sid} depends on CRS ASM instance\"; false; }"
+			fi
+		done
+	fi
+	touch ${SUBSYS}
+}
+
+stop () {
+	local sid
+
+	echo "Stopping Oracle:"
+
+	# shutdown non ASM with Y or W
+	for sid in $(echo "${ORATAB}" | awk -F: '{if ($1 !~ /^+/ && $3 ~ /^[YW]/) {print $1}}'); do
+		( action $"Stopping instance ${sid}" ${BASE}/${NAME} stopinstance ${sid} )
+	done
+	
+	# shutdown ASM instances with a Y
+	for sid in $(echo "${ORATAB}" | awk -F: '{if ($1 ~ /^+/ && $3 ~ /^Y/) {print $1}}'); do
+		( action $"Stopping instance ${sid}" ${BASE}/${NAME} stopinstance ${sid} )
+	done
+
+	if [[ -f "${SUBSYS}" ]]; then rm ${SUBSYS}; fi
+}
+
+status () {
+	echo todo
+}
+
+startinstance () {
+	local orauser
+	local curuser
+	local mode # todo: will grab from a config file. set to null for now
+	local res
+	local i
+	local current_status
+	local desired_status
+
+	if [[ -z "${1}" ]]; then
+		echo "usage: ${NAME} ${FUNCNAME} ORACLE_SID" 1>&2; return 1
+	fi
+
+	export ORACLE_SID=$1
+	ORACLE_HOME=$(getoraclehome "${ORACLE_SID}") || return 1
+	export ORACLE_HOME
+
+	orauser=$(ls -l ${ORACLE_HOME}/bin/oracle | awk '{print $3}') || return 1
+	curuser=$(id -un) || return 1
+
+	if [[ ${orauser} != ${curuser} ]]; then
+		if [[ ${curuser} = "root" ]]; then
+			su ${orauser} -c "${BASE}/${NAME} ${FUNCNAME} ${ORACLE_SID}" || return 1
+		else
+			echo "${FUNCNAME}(${ORACLE_SID}): you must be ${orauser} or root to execute this command." 1>&2
+			return 1
+		fi
+	else
+		if [[ -f ${ORACLE_HOME}/${ORACLE_SID}_${HOST%%.*}.env ]]; then
+			. ${ORACLE_HOME}/${ORACLE_SID}_${HOST%%.*}.env
+		fi
+
+		case "${mode:-"OPEN"}" in
+			OPEN)		desired_status=OPEN;;
+			MOUNT)		desired_status=MOUNTED;;
+			NOMOUNT)	desired_status=STARTED;;
+			*)		echo "${FUNCNAME}(${ORACLE_SID}): invalid instance startup mode (${mode})" 1>&2
+					return 1;;
+		esac
+
+		if [[ $(echo "${ORACLE_SID}" | cut -b 1) = '+' ]]; then
+
+			desired_status="STARTED"
+
+			if [[ ! -x ${ORACLE_HOME}/bin/crsctl ]]; then
+				echo "${FUNCNAME}(${ORACLE_SID}): ${ORACLE_HOME}/bin/crsctl is missing or is not executable" 1>&2
+				return 1
+			fi
+
+			i=0
+			while ! ${ORACLE_HOME}/bin/crsctl check css > /dev/null 2>&1 && [[ ${i} -lt ${CSS_START_TIMEOUT} ]]; do
+				sleep ${DEFAULT_INTERVAL}
+				i=$(( ${i} + ${DEFAULT_INTERVAL} ))
+			done
+
+			if [[ ${i} -eq ${CSS_START_TIMEOUT} ]]; then
+				echo "${FUNCNAME}(${ORACLE_SID}): timeout(${CSS_START_TIMEOUT}) waiting for css service to become available" 1>&2
+				return 1
+			fi
+		fi
+
+		current_status=$(statusinstance ${ORACLE_SID}) || return 1
+
+		if [[ "${current_status}" != "STOPPED" ]]; then
+			echo "${FUNCNAME}(${ORACLE_SID}) instance already running. [status=${current_status}]" 1>&2
+			if [[ "${current_status}" = "${desired_status}" ]]; then
+				return 0
+			else
+				echo "${FUNCNAME}(${ORACLE_SID}) instance status should be ${desired_status}" 1>&2
+				return 1
+			fi
+		else
+			monitorprocess "echo \"startup ${mode}\" | ${ORACLE_HOME}/bin/sqlplus -s '/ as sysdba'" ${DB_STARTUP_TIMEOUT} 1 || return 1
+		fi
+
+		current_status=$(statusinstance ${ORACLE_SID}) || return 1
+
+		if [[ "${current_status}" != "${desired_status}" ]]; then
+			echo "${FUNCNAME}(${ORACLE_SID}): instance failed to start (${mode:-"OPEN"}). [status=${current_status}]" 1>&2
+			return 1
+		fi
+
+		return 0
+	fi
+}
+
+stopinstance () {
+	local orauser
+	local curuser
+	local mode
+	local current_status
+	
+        if [[ -z "${1}" ]]; then
+		echo "usage: ${NAME} ${FUNCNAME} ORACLE_SID" 1>&2; return 1
+        fi
+
+        export ORACLE_SID=$1
+        ORACLE_HOME=$(getoraclehome "${ORACLE_SID}") || return 1
+	export ORACLE_HOME
+
+        orauser=$(ls -l ${ORACLE_HOME}/bin/oracle | awk '{print $3}') || return 1
+        curuser=$(id -un) || return 1
+        mode="immediate"
+
+        if [[ ${orauser} != ${curuser} ]]; then
+                if [[ ${curuser} = "root" ]]; then
+                        su ${orauser} -c "${BASE}/${NAME} stopinstance ${ORACLE_SID}" || return 1
+                else
+                        echo "${FUNCNAME}(${ORACLE_SID}): you must be ${orauser} or root to execute this command." 1>&2
+                        return 1
+                fi
+        else
+		current_status=$(statusinstance ${ORACLE_SID}) || return 1
+		
+		if [[ "${current_status}" = "STOPPED" ]]; then
+			echo "${FUNCNAME}(${ORACLE_SID}): instance is not running" 2>&1
+			return 0
+		fi
+
+		# monitorprocess "echo \"alter system checkpoint;\" | ${ORACLE_HOME}/bin/sqlplus -s '/ as sysdba'" ${DB_SHUTDOWN_TIMEOUT} 1
+
+                monitorprocess "echo \"shutdown ${mode}\" | ${ORACLE_HOME}/bin/sqlplus -s '/ as sysdba'" ${DB_SHUTDOWN_TIMEOUT} 1
+
+		current_status=$(statusinstance ${ORACLE_SID}) || return 1
+
+		if [[ "${current_status}" != "STOPPED" ]]; then
+			monitorprocess "echo \"shutdown abort\" | ${ORACLE_HOME}/bin/sqlplus -s '/ as sysdba'" ${DB_SHUTDOWN_TIMEOUT} 1 || {
+				echo "${FUNCNAME}(${ORACLE_SID}): failed to shutdown instance" 1>&2
+				return 1
+			}
+		fi
+		
+		return 0
+	fi
+
+}
+
+case $1 in 
+	start)			start
+				;;
+
+	stop)			stop
+				;;
+	
+	startinstance)		startinstance ${2}
+				;;
+
+	stopinstance)		stopinstance ${2}
+				;;
+
+	statuscrsasm)		statuscrsasm
+				;;
+
+	startlisteners)		startlisteners
+				;;
+	
+	statusinstance)		statusinstance ${2}
+				;;
+
+	listlisteners)		listlisteners
+				;;
+
+	startlistener)		startlistener "${2}"
+				;;
+
+	waitforcrsasm)		waitforcrsasm
+				;;
+	
+	*)			echo "usage: ${NAME} {start|stop|startinstance|stopinstance|statusinstance|startlistener|listlisteners}" 1>&2
+				exit 1
+esac
